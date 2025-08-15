@@ -1,0 +1,88 @@
+``` 
+Author: Tayvion P (@tayontech) 
+Description: This query detects suspicious Okta logins by identifying sessions where a user,
+            logging in from a new IP/device/city combination, successfully passes an initial
+             authentication factor but then fails or abandons a subsequent MFA challenge.
+             It then filters out any events that originated from a known corporate VPN IP.
+
+Note: You may have to change field names based on your environment's field mappings.
+```
+```
+== Step 1: Initial Data Retrieval and Session Aggregation ==
+ Gather all relevant Okta authentication events.
+ Group events by user and session ID. For each session, collect key details like
+ the start time, all outcomes, the final outcome, and the latest client information.
+```
+index=okta
+    (eventType="user.authentication.sso" OR eventType="user.authentication.auth_via_mfa" OR eventType="policy.evaluate_sign_on")
+
+| stats
+    earliest(_time) as _time,
+    values(outcome.result) as results,
+    latest(outcome.result) as last_result,
+    latest(client.ipAddress) as src_ip,
+    latest(client.userAgent.rawUserAgent) as user_agent,
+    latest(client.geographicalContext.city) as city,
+    latest(client.geographicalContext.state) as state,
+    latest(client.geographicalContext.country) as country
+    by actor.alternateId, authenticationContext.externalSessionId
+
+ ```   
+ == Step 2: Identify Suspicious MFA Failure/Abandonment ==
+ Filter for sessions that contain at least one "SUCCESS" (initial login)
+ and one "CHALLENGE" (MFA was prompted), but where the very last event
+ was either a "FAILURE" or "ABANDONED".
+```
+
+| where
+    (isnotnull(mvfind(results, "SUCCESS")) AND isnotnull(mvfind(results, "CHALLENGE"))) AND
+    (last_result="FAILURE" OR last_result="ABANDONED")
+
+# == Step 3: Enrich with Historical User Behavior ==
+# Use a subsearch to join the suspicious events with a list of known IPs,
+# user agents, and cities used by that same user in successful logins
+# over the past 30 days.
+| join actor.alternateId [
+    search index=okta eventType="user.authentication.sso" outcome.result="SUCCESS" earliest=-30d@d
+    | stats
+        values(client.ipAddress) as known_ips,
+        values(client.userAgent.rawUserAgent) as known_user_agents,
+        values(client.geographicalContext.city) as known_cities
+        by actor.alternateId
+]
+
+```
+ == Step 4: Isolate Anomalous Behavior ==
+ Keep only the events where the IP, user agent, AND city from the
+ suspicious session are ALL new and do not appear in the user's 30-day history.
+```
+| where
+    isnull(mvfind(known_ips, src_ip)) AND
+    isnull(mvfind(known_user_agents, user_agent)) AND
+    isnull(mvfind(known_cities, city))
+
+```
+    == Step 5: Filter Out Known VPN IPs ==
+ Use a fast 'tstats' subsearch to get a list of all unique IPs from the Palo Alto
+ network logs (VPN IPs). Then, remove any suspicious events where the 'src_ip'
+ matches an IP from this VPN list. This reduces false positives from legitimate remote work.
+```
+| search NOT [| tstats count where index=pan_logs earliest=-30d@d by src_translated_ip
+    | fields src_translated_ip
+    | rename src_translated_ip as src_ip]
+
+```
+ == Step 6: Final Aggregation and Formatting ==
+ Group the final set of alerts into 30-minute windows for easier analysis.
+```
+| bin _time span=30m
+
+
+| stats
+    earliest(_time) AS initial_detection_time,
+    values(user_agent) AS user_agent,
+    values(last_result) AS outcome_result,
+    count
+    by _time, src_ip, actor.alternateId, city, state, country
+
+| eval initial_detection_time = strftime(initial_detection_time,"%F %H:%M:%S %Z")
