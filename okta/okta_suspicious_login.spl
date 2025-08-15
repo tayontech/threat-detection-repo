@@ -63,7 +63,7 @@ index=okta
 
 ```
     == Step 5: Filter Out Known VPN IPs ==
- Use a fast 'tstats' subsearch to get a list of all unique IPs from the Palo Alto
+ Use a fast 'tstats' subsearch to get a list of all unique IPs from the
  network logs (VPN IPs). Then, remove any suspicious events where the 'src_ip'
  matches an IP from this VPN list. This reduces false positives from legitimate remote work.
 ```
