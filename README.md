@@ -1,11 +1,10 @@
 # Threat Detections Repository
 
-This repository contains threat detection queries for multiple platforms such as Okta, Azure, and AWS.
+This repository contains threat detection queries.
 
 ## Structure
 
 - `okta/` - Contains detections for Okta authentication events.
-- `proofpoint/` - Contains detections for Proofpoint events.
 - `aws/` - Contains detections for AWS events.
 
 ## Usage
