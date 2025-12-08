@@ -1,0 +1,27 @@
+
+  index=cloudtrail sourcetype=aws:cloudtrail eventSource="iam.amazonaws.com" eventName IN ("CreateRole","UpdateAssumeRolePolicy")
+  | eval assume_doc = coalesce(
+      'requestParameters.assumeRolePolicyDocument',
+      'requestParameters.policyDocument'
+  )
+  | eval assume_doc = urldecode(assume_doc)
+  | rex field=assume_doc max_match=0 "\"arn:aws:iam::(?<principal_account_ids>\d{12})"
+  | mvexpand principal_account_ids
+  | where isnotnull(principal_account_ids)
+  | where principal_account_ids != aws_account_id
+  | lookup aws_org_accounts.csv account_id as principal_account_ids OUTPUT account_id as org_account_id
+  | where isnull(org_account_id)
+
+  | stats
+      min(_time)                        as initial_detection_time
+      values(sourceIPAddress)           as src_ip
+      values(eventName)                 as eventName
+      values(assume_doc)                as assumed_policies
+      values(aws_account_id)            as cloudaccount
+      values(principal_account_ids)     as external_account
+      values(awsRegion)                 as awsregion
+    by user_arn,requestParameters.roleName
+  | where isnotnull(external_account) AND external_account!=""
+  | rename requestParameters.roleName as role_assumed
+  | eval initial_detection_time = strftime(initial_detection_time,"%F %T %Z")
+  
