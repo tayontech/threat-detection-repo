@@ -1,1 +1,77 @@
+```
+Author: Tayvion P. (@tayontech)
+Desription:
+  Detects the creation or update of an IAM Role trust policy that allows an 
+  external AWS root account** to assume the role, but fails to use the 
+  `sts:ExternalId` condition**. This misconfiguration exposes the role to the 
+  Confused Deputy attack, where an attacker in the external account can trick a 
+  trusted service into assuming the role, granting them full control over the role’s permissions. 
+tags:
+  - attack.privilege_escalation
+  - attack.defense_evasion
+  - attack.t1199 
+  - attack.t1562.001
+```
 
+index=cloudtrail eventSource="iam.amazonaws.com" eventName IN ("CreateRole","UpdateAssumeRolePolicy")
+  | search userIdentity.arn != <service-account> // OIDC-based role assumptions (GitHub Actions, etc.) must be excluded here to avoid false positives.
+  | eval assume_doc = urldecode(coalesce(
+      'requestParameters.assumeRolePolicyDocument',
+      'requestParameters.policyDocument'
+    ))
+
+  | where NOT like(assume_doc, "%\"sts:ExternalId\"%")
+
+  | rex field=assume_doc max_match=0 "arn:aws:iam::(?<principal_root_account>\d{12}):root"
+  | where mvcount(principal_root_account) > 0
+  | mvexpand principal_root_account
+  | where principal_root_account != aws_account_id
+
+  | stats
+    min(_time)                    as initial_detection_time
+    values(sourceIPAddress)       as src_ip
+    values(user_agent)            as user_agent
+    values(assume_doc)            as policy_arn
+    values(aws_account_id)       as cloudaccount
+    values(principal_root_account) as external_cloud_account
+  by userIdentity.arn requestParameters.roleName
+
+  | eval initial_detection_time = strftime(initial_detection_time,"%F %T %Z")
+  | rename requestParameters.roleName as role_updated
+
+
+```
+Author: Tayvion P. (@tayontech)
+Desription:
+Detect Anomalous AccessDenied AWS API calls for a single identity and source IP,  relative to that identity historical baseline over the past 30 days.
+Sudden increases in denied requests or API variety may indicate reconnaissance, permission probing, or misconfigured automation.
+tags:
+  - attack.discovery
+  - attack.t1069.003
+  - attack.t1110.004
+```
+
+
+index=cloudtrail errorCode="AccessDenied" earliest=-30d latest=now()
+  | bin _time span=15m
+
+  | stats
+      count                        as access_denied_count
+      min(_time)                   as initial_detection_time
+      values(eventName)            as eventName
+      values(awsRegion)            as awsregion
+      values(errorMessage)         as error_messages
+      values(user_agent)           as useragent
+      dc(eventName)                as unique_apis
+    by _time, aws_account_id, sourceIPAddress, userIdentity.arn, userIdentity.type
+
+  | anomalydetection
+      access_denied_count
+      action=annotate
+      BY aws_account_id sourceIPAddress userIdentity.arn
+
+  | eval isOutlier = if(probable_cause != "", "1", "0")
+  | where isOutlier=1 AND _time >= relative_time(now(), "-15m@s") AND _time <  relative_time(now(), "@s")
+  | rename sourceIPAddress as src_ip, aws_account_id as cloud_account
+  | eval initial_detection_time = strftime(_time,"%F %H:%M:%S %Z")
+  | rename userIdentity.arn as userarn, userIdentity.type as userIdentity_type
