@@ -1,0 +1,68 @@
+```
+author: Tayvion P. (@tayontech)
+
+description: 
+Detects a sequence of events where an AWS IAM Role Trust Policy or a Role's managed policy 
+is modified (UpdateAssumeRolePolicy, PutRolePolicy) and is immediately followed by a successful 
+assumption of that role (AssumeRole, AssumeRoleWithSAML, etc.) within a 10-minute window. 
+This behavior is characteristic of an attacker setting up a backdoor or escalating privileges 
+by granting a new, unauthorized principal (user, service, or account) permission to assume a critical role
+
+some fields may need to be changed to represent your current environment
+tags:
+  - attack.privilege_escalation
+  - attack.persistence
+  - attack.t1098.001 
+  - attack.t1550.001 
+```
+
+index=cloudtrail sourcetype=aws:cloudtrail eventSource IN ("iam.amazonaws.com", "sts.amazonaws.com")
+  eventName IN (
+      "UpdateAssumeRolePolicy",
+      "SetDefaultPolicyVersion",
+      "PutRolePolicy",
+      "AssumeRole",
+      "AssumeRoleWithWebIdentity",
+      "AssumeRoleWithSAML"
+  )
+  | eval action_type = case(
+      eventName IN ("UpdateAssumeRolePolicy","SetDefaultPolicyVersion","PutRolePolicy"), "role_trust_change",
+      eventName IN ("AssumeRole","AssumeRoleWithWebIdentity","AssumeRoleWithSAML"), "role_assume",
+      true(), "other"
+  )
+  | eval role_name = coalesce(
+      'requestParameters.roleName',
+      mvindex(split('requestParameters.roleArn', "/"), -1)
+  )
+  | eval role_key = aws_account_id . "|" . role_name
+
+  | sort 0 role_key _time
+
+  | streamstats
+      current=f
+      last(action_type) as prev_action_type
+      last(_time)       as prev_action_time
+      last(user_arn)    as prev_actor
+      by role_key
+
+  | eval seconds_since_prev = _time - prev_action_time
+
+  | where
+      action_type      = "role_assume"
+      AND prev_action_type = "role_trust_change"
+      AND seconds_since_prev <= 600
+
+  | stats
+      min(_time)              as initial_detection_time
+      values(sourceIPAddress) as src_ip
+      values(user_arn)        as user_arn
+      values(eventName)       as eventName
+      values(role_name)       as role_assumed
+      values(userAgent)       as useragent
+      values(awsRegion)       as region
+      values(aws_account_id)  as cloud_account
+      values(prev_actor)      as policy_modifier_arn
+      values(prev_action_time) as policy_modification_time
+    by role_key
+
+  | eval initial_detection_time = strftime(initial_detection_time,"%F %H:%M:%S %Z")
