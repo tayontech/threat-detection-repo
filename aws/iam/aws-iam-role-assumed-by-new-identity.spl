@@ -1,0 +1,52 @@
+```
+Author: Tayvion P. (@tayontech)
+Description: Detects IAM roles being assumed by an identity that has not used the same role within the configured historical window (7 days). 
+Sudden usage of a previously unused or dormant role can indicate lateral movement, privilege escalation, compromised credentials, or deviation from normal workload behavior. 
+The detection excludes AWS internal service identities to focus on human and workload actors.
+
+tags:
+  - attack.initial_access
+  - attack.privilege_escalation 
+  - attack.t1078.004 
+  - attack.t1550.001 
+```
+
+index=cloudtrail eventName="AssumeRole"
+  | search
+      NOT userIdentity.type = "AWSService"
+      NOT userIdentity.arn = <service-account> // filter known service accounts
+
+
+  | eval is_recent = if(
+          _time >= relative_time(now(), "-15m@s")
+          AND _time < relative_time(now(), "@s"),
+          1, 0
+      )
+
+  | eval is_hist = if(
+          _time >= relative_time(now(), "-7d")
+          AND _time < relative_time(now(), "-15m@s"),
+          1, 0
+      )
+  | stats
+      max(is_recent) as has_recent
+      max(is_hist)   as has_hist
+      earliest(eval(if(is_recent=1, _time, null()))) as initial_detection_time
+      values(sourceIPAddress)    as src_ips
+      values(user_agent)         as user_agents
+      values(aws_account_id)     as cloud_accounts
+      values(userIdentity.type)  as identity_types
+    by userIdentity.arn requestParameters.roleArn
+
+  | where has_recent=1 AND has_hist=0 AND isnotnull(initial_detection_time)
+
+  | stats
+      min(initial_detection_time)       as initial_detection_time
+      values(src_ips)                   as src_ip
+      values(requestParameters.roleArn) as assumed_roles
+      values(identity_types)            as identity_types
+      values(cloud_accounts)            as cloudaccount
+      values(user_agents)               as useragent
+    by userIdentity.arn
+  | rename userIdentity.arn as user_arn
+  | eval initial_detection_time = strftime(initial_detection_time, "%F %H:%M:%S %Z")
