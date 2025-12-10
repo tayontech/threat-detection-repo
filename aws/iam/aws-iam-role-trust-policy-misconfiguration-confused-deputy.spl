@@ -10,27 +10,54 @@ tags:
 ```
 
 index=cloudtrail eventSource="iam.amazonaws.com" eventName IN ("CreateRole","UpdateAssumeRolePolicy")
-  | search userIdentity.arn != <service-account> // OIDC-based role assumptions (GitHub Actions, etc.) must be excluded here to avoid false positives.
-  | eval assume_doc = urldecode(coalesce(
-      'requestParameters.assumeRolePolicyDocument',
-      'requestParameters.policyDocument'
-    ))
+| search userIdentity.arn != <service-account> // OIDC-based role assumptions (GitHub Actions, etc.) must be excluded here to avoid false positives.
+  eventName IN ("CreateRole","UpdateAssumeRolePolicy")
 
-  | where NOT like(assume_doc, "%\"sts:ExternalId\"%")
+| eval assume_doc = urldecode(coalesce(
+    'requestParameters.assumeRolePolicyDocument',
+    'requestParameters.policyDocument'
+))
 
-  | rex field=assume_doc max_match=0 "arn:aws:iam::(?<principal_root_account>\d{12}):root"
-  | where mvcount(principal_root_account) > 0
-  | mvexpand principal_root_account
-  | where principal_root_account != aws_account_id
+| spath input=assume_doc path=Statement{} output=stmt
+| mvexpand stmt
 
-  | stats
+| spath input=stmt path=Principal output=principal
+| spath input=stmt path=Condition output=condition
+
+| spath input=principal path=AWS{} output=aws_principal
+| mvexpand aws_principal
+
+| eval aws_principal = coalesce(aws_principal, principal)
+| rex field=aws_principal "arn:aws:iam::(?<principal_account_id>\d{12}):(?<principal_suffix>[^\"}]+)"
+
+| eval principal_account_id = coalesce(
+    principal_account_id,
+    if(match(aws_principal, "^\d{12}$"), aws_principal, null())
+)
+| where isnotnull(principal_account_id)
+| where principal_account_id != aws_account_id
+
+| eval has_external_id    = if(like(stmt, "%\"sts:ExternalId\"%"), 1, 0)
+| eval has_source_account = if(like(stmt, "%\"aws:SourceAccount\"%"), 1, 0)
+| eval has_source_arn     = if(like(stmt, "%\"aws:SourceArn\"%"), 1, 0)
+| eval has_protection = if(
+    has_external_id=1 OR has_source_account=1 OR has_source_arn=1,
+    1,
+    0
+)
+| where has_protection = 0
+| stats
     min(_time)                    as initial_detection_time
     values(sourceIPAddress)       as src_ip
-    values(user_agent)            as user_agent
-    values(assume_doc)            as policy_arn
-    values(aws_account_id)       as cloudaccount
-    values(principal_root_account) as external_cloud_account
-  by userIdentity.arn requestParameters.roleName
+    values(assume_doc)            as assumed_policy
+    values(user_agent)            as useragent
+    values(aws_account_id)        as cloudaccount
+    values(principal_account_id)  as external_account
+    values(awsRegion)             as awsregion
+  by userIdentity.arn,
+     requestParameters.roleName
 
-  | eval initial_detection_time = strftime(initial_detection_time,"%F %T %Z")
-  | rename requestParameters.roleName as role_updated
+| rename userIdentity.arn as actor_arn,
+         requestParameters.roleName as role_name
+
+| eval initial_detection_time = strftime(initial_detection_time, "%F %T %Z")
