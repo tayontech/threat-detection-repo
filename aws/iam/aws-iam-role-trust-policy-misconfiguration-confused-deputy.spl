@@ -1,7 +1,7 @@
 ```
 Author: Tayvion P. (@tayontech)
 Desription:
-  Detects the creation or update of an IAM Role trust policy that allows an external AWS root account to assume the role, but fails to use the `sts:ExternalId` condition. This misconfiguration exposes the role to the Confused Deputy attack, where an attacker in the external account can trick a trusted service into assuming the role, granting them full control over the role’s permissions. 
+Detects AWS IAM roles whose trust policies were newly created or updated to allow cross-account AWS principals to assume the role without any confused-deputy protections in place.
 tags:
   - attack.privilege_escalation
   - attack.defense_evasion
@@ -61,3 +61,4 @@ index=cloudtrail eventSource="iam.amazonaws.com" eventName IN ("CreateRole","Upd
          requestParameters.roleName as role_name
 
 | eval initial_detection_time = strftime(initial_detection_time, "%F %T %Z")
+
