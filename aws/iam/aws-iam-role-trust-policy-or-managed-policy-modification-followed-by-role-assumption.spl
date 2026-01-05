@@ -16,53 +16,81 @@ tags:
   - attack.t1550.001 
 ```
 
-index=cloudtrail sourcetype=aws:cloudtrail eventSource IN ("iam.amazonaws.com", "sts.amazonaws.com")
+index=cloudtrail sourcetype=aws:cloudtrail eventSource IN ("iam.amazonaws.com","sts.amazonaws.com")
   eventName IN (
-      "UpdateAssumeRolePolicy",
-      "SetDefaultPolicyVersion",
-      "PutRolePolicy",
-      "AssumeRole",
-      "AssumeRoleWithWebIdentity",
-      "AssumeRoleWithSAML"
+    "UpdateAssumeRolePolicy",
+    "SetDefaultPolicyVersion",
+    "PutRolePolicy",
+    "AssumeRole",
+    "AssumeRoleWithWebIdentity",
+    "AssumeRoleWithSAML"
   )
+
   | eval action_type = case(
       eventName IN ("UpdateAssumeRolePolicy","SetDefaultPolicyVersion","PutRolePolicy"), "role_trust_change",
       eventName IN ("AssumeRole","AssumeRoleWithWebIdentity","AssumeRoleWithSAML"), "role_assume",
       true(), "other"
   )
+
   | eval role_name = coalesce(
       'requestParameters.roleName',
       mvindex(split('requestParameters.roleArn', "/"), -1)
   )
-  | eval role_key = aws_account_id . "|" . role_name
+  | where isnotnull(role_name)
 
-  | sort 0 role_key _time
+  | eval invoked_by = 'userIdentity.invokedBy'
+  | eval ui_type = 'userIdentity.type'
 
-  | streamstats
-      current=f
-      last(action_type) as prev_action_type
-      last(_time)       as prev_action_time
-      last(user_arn)    as prev_actor
-      by role_key
+  | eval is_automation_flag = if(
+      invoked_by IN ("cloudformation.amazonaws.com","eks.amazonaws.com","sts.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
+      OR ui_type="AWSService",
+      1, 0
+  )
+  | eval is_automation = if(is_automation_flag=1,"true","false")
+
+  | eval trust_policy = if(eventName="UpdateAssumeRolePolicy", 'requestParameters.policyDocument', null())
+
+  | eventstats max(eval(action_type="role_trust_change")) as has_trust_change
+      by aws_account_id, role_name, userIdentity.arn
+  | where has_trust_change=1
+
+  | sort aws_account_id role_name userIdentity.arn _time
+
+  | streamstats current=f
+      last(action_type)        as prev_action_type
+      last(_time)              as prev_action_time
+      last(is_automation_flag) as prev_is_automation_flag
+      last(invoked_by)         as prev_invoked_by
+      last(ui_type)            as prev_ui_type
+      last(trust_policy)       as prev_trust_policy
+    by aws_account_id, role_name, userIdentity.arn
 
   | eval seconds_since_prev = _time - prev_action_time
 
-  | where
-      action_type      = "role_assume"
-      AND prev_action_type = "role_trust_change"
-      AND seconds_since_prev <= 600
+  | where action_type="role_assume"
+    AND prev_action_type="role_trust_change"
+    AND seconds_since_prev<=600
+
+  | where NOT (
+      prev_is_automation_flag=1 AND is_automation_flag=1
+      AND (
+        invoked_by IN ("cloudformation.amazonaws.com","eks.amazonaws.com","sts.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
+        OR ui_type="AWSService"
+      )
+      AND (
+        prev_invoked_by IN ("cloudformation.amazonaws.com","eks.amazonaws.com","sts.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
+        OR prev_ui_type="AWSService"
+      )
+  )
 
   | stats
-      min(_time)              as initial_detection_time
-      values(sourceIPAddress) as src_ip
-      values(user_arn)        as user_arn
-      values(eventName)       as eventName
-      values(role_name)       as role_assumed
-      values(userAgent)       as useragent
-      values(awsRegion)       as region
-      values(aws_account_id)  as cloud_account
-      values(prev_actor)      as policy_modifier_arn
-      values(prev_action_time) as policy_modification_time
-    by role_key
+      min(_time)                   as initial_detection_time
+      values(sourceIPAddress)      as source_ip
+      values(role_name)            as roles_assumed
+      values(prev_trust_policy)    as trust_policy_modified
+      values(userAgent)            as user_agent
+      values(aws_account_id)       as cloud_account
+      values(is_automation)        as is_automation
+    by userIdentity.arn
 
-  | eval initial_detection_time = strftime(initial_detection_time,"%F %H:%M:%S %Z")
+  | eval initial_detection_time = strftime(initial_detection_time,"%F %T %Z")
