@@ -16,65 +16,71 @@ tags:
   - attack.t1562.001 
 ```
 index=cloudtrail sourcetype=aws:cloudtrail eventSource="iam.amazonaws.com"
-  (
-    eventName IN (
-      "CreatePolicy",
-      "CreatePolicyVersion",
-      "SetDefaultPolicyVersion",
-      "DeletePolicyVersion",
-      "PutUserPolicy",
-      "PutRolePolicy",
-      "PutGroupPolicy"
-    )
-    OR
-    eventName IN (
-      "AttachUserPolicy",
-      "AttachRolePolicy",
-      "AttachGroupPolicy"
-    )
+  eventName IN (
+    "CreatePolicy","CreatePolicyVersion","SetDefaultPolicyVersion","DeletePolicyVersion",
+    "AttachUserPolicy","AttachRolePolicy","AttachGroupPolicy"
   )
   | eval action_type = case(
-      eventName IN (
-        "CreatePolicy",
-        "CreatePolicyVersion",
-        "SetDefaultPolicyVersion",
-        "DeletePolicyVersion",
-        "PutUserPolicy",
-        "PutRolePolicy",
-        "PutGroupPolicy"
-      ), "policy_change",
-      eventName IN (
-        "AttachUserPolicy",
-        "AttachRolePolicy",
-        "AttachGroupPolicy"
-      ), "policy_attach",
+      eventName IN ("CreatePolicy","CreatePolicyVersion","SetDefaultPolicyVersion","DeletePolicyVersion"), "policy_change",
+      eventName IN ("AttachUserPolicy","AttachRolePolicy","AttachGroupPolicy"), "policy_attach",
       true(), "other"
   )
-  | eval target_principal = coalesce('requestParameters.userName', 'requestParameters.roleName', 'requestParameters.groupName'),
-         policy_arn = coalesce('requestParameters.policyArn', 'responseElements.policy.arn')
 
-  | sort 0 aws_account_id userIdentity.arn policy_arn _time
+  | eval policy_arn = coalesce('requestParameters.policyArn','responseElements.policy.arn')
+  | where isnotnull(policy_arn)
 
-  | streamstats
-      current=f
-      last(action_type) as prev_action_type
-      last(_time)       as prev_action_time
-      by aws_account_id, userIdentity.arn, policy_arn
+  | eval target_principal = coalesce('requestParameters.userName','requestParameters.roleName','requestParameters.groupName')
+
+  | eval ui_type = 'userIdentity.type'
+  | eval invoked_by = 'userIdentity.invokedBy'
+
+  | eval is_automation_flag = if(
+      invoked_by IN ("cloudformation.amazonaws.com","autoscaling.amazonaws.com","eks.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
+      OR ui_type="AWSService"
+      OR match(user_arn, "(?i)terraform|pulumi|cloudformation|cicd|pipeline|github|jenkins")
+      OR match(userAgent, "(?i)\\bterraform\\b|\\bpulumi\\b|\\bcloudformation\\b|\\bjenkins\\b|\\bgitlab\\b|\\bcircleci\\b|\\bgithub\\b|\\bactions\\b"),
+      1, 0
+  )
+  | eval is_automation = if(is_automation_flag=1, "true", "false")
+
+  | sort 0 aws_account_id policy_arn user_arn _time
+  | streamstats current=f
+      last(action_type)         as prev_action_type
+      last(_time)               as prev_action_time
+      last(is_automation_flag)  as prev_is_automation_flag
+      last(invoked_by)          as prev_invoked_by
+      last(ui_type)             as prev_ui_type
+    by aws_account_id, policy_arn, user_arn
 
   | eval seconds_since_prev = _time - prev_action_time
 
-  | where
-      action_type      = "policy_attach"
-      AND prev_action_type = "policy_change"
-      AND seconds_since_prev <= 600
-  | stats
-      min(_time)             as initial_detection_time
-      values(eventName)      as eventName
-      values(sourceIPAddress) as src_ip
-      values(target_principal) as target_principal
-      values(userAgent)      as user_agent
-      values(aws_account_id) as cloud_accounts
-      values(awsRegion)      as aws_regions
-    by userIdentity.arn
+  | where action_type="policy_attach"
+    AND prev_action_type="policy_change"
+    AND seconds_since_prev<=600
 
-  | eval initial_detection_time = strftime(initial_detection_time, "%F %H:%M:%S %Z")
+  | where NOT (
+      prev_is_automation_flag=1 AND is_automation_flag=1
+      AND (
+        invoked_by IN ("cloudformation.amazonaws.com","autoscaling.amazonaws.com","eks.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
+        OR ui_type="AWSService"
+      )
+      AND (
+        prev_invoked_by IN ("cloudformation.amazonaws.com","autoscaling.amazonaws.com","eks.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
+        OR prev_ui_type="AWSService"
+      )
+  )
+
+  | stats
+      min(_time)               as initial_detection_time
+      values(eventName)        as actions
+      values(policy_arn)       as policy_arn
+      values(target_principal) as target_principal
+      values(sourceIPAddress)  as source_ip
+      values(userAgent)        as user_agent
+      values(awsRegion)        as aws_region
+      values(ui_type)          as identity_type
+      values(invoked_by)       as invoked_by
+      values(is_automation)    as is_automation
+    by aws_account_id, user_arn
+
+  | eval initial_detection_time = strftime(initial_detection_time, "%F %T %Z")
