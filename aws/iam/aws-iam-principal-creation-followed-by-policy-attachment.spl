@@ -29,51 +29,72 @@ index=cloudtrail sourcetype=aws:cloudtrail eventSource="iam.amazonaws.com"
     "PutGroupPolicy"
   )
 
-  | eval target_principal = coalesce(
-      'requestParameters.userName',
-      'requestParameters.roleName',
-      'requestParameters.groupName'
+  | eval target_principal = coalesce('requestParameters.userName','requestParameters.roleName','requestParameters.groupName')
+
+  | eval ui_type = 'userIdentity.type'
+  | eval principal_id = 'userIdentity.principalId'
+  | eval invoked_by = 'userIdentity.invokedBy'
+  | eval session_issuer_arn = 'userIdentity.sessionContext.sessionIssuer.arn'
+  | eval session_issuer_type = 'userIdentity.sessionContext.sessionIssuer.type'
+  | eval session_name = mvindex(split(user_arn, "/"), -1)
+
+  | eval actor_session = coalesce(session_issuer_arn, user_arn) . " :: " . coalesce(session_name, principal_id, "na")
+
+  | eval is_automation_flag = if(
+      invoked_by IN ("cloudformation.amazonaws.com","autoscaling.amazonaws.com","eks.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
+      OR ui_type="AWSService"
+      OR match(user_arn, "(?i)terraform|pulumi|cloudformation|cicd|pipeline|github|jenkins")
+      OR match(userAgent, "(?i)\\bterraform\\b|\\bpulumi\\b|\\bcloudformation\\b|\\bjenkins\\b|\\bgitlab\\b|\\bcircleci\\b|\\bgithub\\b|\\bactions\\b"),
+      1, 0
   )
+  | eval is_automation = if(is_automation_flag=1, "true", "false")
 
   | eval action_type = case(
-      eventName IN ("CreateUser","CreateRole","CreateGroup","CreateServiceLinkedRole"),
-          "principal_create",
-      eventName IN ("AttachUserPolicy","AttachRolePolicy","AttachGroupPolicy",
-                    "PutUserPolicy","PutRolePolicy","PutGroupPolicy"),
-          "policy_attach",
+      eventName IN ("CreateUser","CreateRole","CreateGroup","CreateServiceLinkedRole"), "principal_create",
+      eventName IN ("AttachUserPolicy","AttachRolePolicy","AttachGroupPolicy","PutUserPolicy","PutRolePolicy","PutGroupPolicy"), "policy_attach",
       true(), "other"
   )
 
-  | eval policy_identifier = coalesce(
-      'requestParameters.policyArn',
-      'requestParameters.policyDocument'
-  )
+  | eval policy_identifier = coalesce('requestParameters.policyArn','requestParameters.policyDocument')
 
-  | sort 0 aws_account_id target_principal _time
-
-  | streamstats
-      current=f
-      last(action_type) as prev_action_type
-      last(_time)       as prev_action_time
-      last(user_arn)    as prev_actor_arn
-      by aws_account_id, target_principal
+  | sort 0 aws_account_id target_principal actor_session _time
+  | streamstats current=f
+      last(action_type)         as prev_action_type
+      last(_time)               as prev_action_time
+      last(is_automation_flag)  as prev_is_automation_flag
+      last(invoked_by)          as prev_invoked_by
+      last(ui_type)             as prev_ui_type
+    by aws_account_id, target_principal, actor_session
 
   | eval seconds_since_prev = _time - prev_action_time
 
-  | where
-      action_type      = "policy_attach"
-      AND prev_action_type = "principal_create"
-      AND seconds_since_prev <= 600
+  | where action_type="policy_attach"
+    AND prev_action_type="principal_create"
+    AND seconds_since_prev<=600
+
+  | where NOT (
+      prev_is_automation_flag=1 AND is_automation_flag=1
+      AND (
+        invoked_by IN ("cloudformation.amazonaws.com","autoscaling.amazonaws.com","eks.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
+        OR ui_type="AWSService"
+      )
+      AND (
+        prev_invoked_by IN ("cloudformation.amazonaws.com","autoscaling.amazonaws.com","eks.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
+        OR prev_ui_type="AWSService"
+      )
+  )
 
   | stats
-      min(_time)             as initial_detection_time
-      values(sourceIPAddress) as src_ip
-      values(eventName)      as eventName
-      values(target_principal) as principal_created
-      values(policy_identifier) as policy_attached
-      values(userAgent)      as useragent
-      values(awsRegion)      as awsregion
-      values(aws_account_id) as cloud_account
+      min(_time)                  as initial_detection_time
+      values(sourceIPAddress)     as sourceip
+      values(eventName)           as actions
+      values(target_principal)    as principal_created
+      values(policy_identifier)   as policy_attached
+      values(userAgent)           as useragent
+      values(aws_account_id)      as cloudaccount
+      values(ui_type)             as identity_type
+      values(is_automation)       as is_automation
     by user_arn
 
   | eval initial_detection_time = strftime(initial_detection_time, "%F %T %Z")
+
