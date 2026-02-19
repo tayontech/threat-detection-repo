@@ -16,85 +16,122 @@ tags:
   - attack.t1098 
 ```
 
-index=cloudtrail sourcetype=aws:cloudtrail eventSource="iam.amazonaws.com"
-  eventName IN (
-    "CreateUser",
-    "CreateRole",
-    "CreateGroup",
-    "CreateServiceLinkedRole",
-    "AttachUserPolicy",
-    "AttachRolePolicy",
-    "AttachGroupPolicy",
-    "PutUserPolicy",
-    "PutRolePolicy",
-    "PutGroupPolicy"
+index=cloudtrail eventSource="iam.amazonaws.com"
+ eventName IN (
+  "CreateUser","CreateRole","CreateGroup","CreateServiceLinkedRole",
+  "AttachUserPolicy","AttachRolePolicy","AttachGroupPolicy",
+  "PutUserPolicy","PutRolePolicy","PutGroupPolicy",
+  "AddUserToGroup"
   )
 
   | eval target_principal = coalesce('requestParameters.userName','requestParameters.roleName','requestParameters.groupName')
 
-  | eval ui_type = 'userIdentity.type'
-  | eval principal_id = 'userIdentity.principalId'
-  | eval invoked_by = 'userIdentity.invokedBy'
-  | eval session_issuer_arn = 'userIdentity.sessionContext.sessionIssuer.arn'
-  | eval session_issuer_type = 'userIdentity.sessionContext.sessionIssuer.type'
-  | eval session_name = mvindex(split(user_arn, "/"), -1)
-
-  | eval actor_session = coalesce(session_issuer_arn, user_arn) . " :: " . coalesce(session_name, principal_id, "na")
-
-  | eval is_automation_flag = if(
-      invoked_by IN ("cloudformation.amazonaws.com","autoscaling.amazonaws.com","eks.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
-      OR ui_type="AWSService"
-      OR match(user_arn, "(?i)terraform|pulumi|cloudformation|cicd|pipeline|github|jenkins")
-      OR match(userAgent, "(?i)\\bterraform\\b|\\bpulumi\\b|\\bcloudformation\\b|\\bjenkins\\b|\\bgitlab\\b|\\bcircleci\\b|\\bgithub\\b|\\bactions\\b"),
-      1, 0
-  )
-  | eval is_automation = if(is_automation_flag=1, "true", "false")
-
   | eval action_type = case(
       eventName IN ("CreateUser","CreateRole","CreateGroup","CreateServiceLinkedRole"), "principal_create",
-      eventName IN ("AttachUserPolicy","AttachRolePolicy","AttachGroupPolicy","PutUserPolicy","PutRolePolicy","PutGroupPolicy"), "policy_attach",
+      eventName IN ("AttachUserPolicy","AttachRolePolicy","AttachGroupPolicy","PutUserPolicy","PutRolePolicy","PutGroupPolicy","AddUserToGroup"), "priv_assign",
       true(), "other"
   )
 
-  | eval policy_identifier = coalesce('requestParameters.policyArn','requestParameters.policyDocument')
-
-  | sort 0 aws_account_id target_principal actor_session _time
-  | streamstats current=f
-      last(action_type)         as prev_action_type
-      last(_time)               as prev_action_time
-      last(is_automation_flag)  as prev_is_automation_flag
-      last(invoked_by)          as prev_invoked_by
-      last(ui_type)             as prev_ui_type
-    by aws_account_id, target_principal, actor_session
-
+  | sort 0 userIdentity.accountId target_principal _time
+  | streamstats current=f last(action_type) as prev_action_type last(_time) as prev_action_time
+    by userIdentity.accountId, target_principal
   | eval seconds_since_prev = _time - prev_action_time
 
-  | where action_type="policy_attach"
+  | where action_type="priv_assign"
     AND prev_action_type="principal_create"
     AND seconds_since_prev<=600
 
-  | where NOT (
-      prev_is_automation_flag=1 AND is_automation_flag=1
-      AND (
-        invoked_by IN ("cloudformation.amazonaws.com","autoscaling.amazonaws.com","eks.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
-        OR ui_type="AWSService"
-      )
-      AND (
-        prev_invoked_by IN ("cloudformation.amazonaws.com","autoscaling.amazonaws.com","eks.amazonaws.com","ssm.amazonaws.com","config.amazonaws.com")
-        OR prev_ui_type="AWSService"
-      )
+  | eval attach_kind = case(
+      eventName IN ("AttachUserPolicy","AttachRolePolicy","AttachGroupPolicy"), "policy_arn_attach",
+      eventName IN ("PutUserPolicy","PutRolePolicy","PutGroupPolicy"), "inline_policy_put",
+      eventName="AddUserToGroup", "group_membership",
+      true(), "other"
   )
 
+  | eval inline_policy = if(
+      attach_kind="inline_policy_put",
+      coalesce(urldecode('requestParameters.policyDocument'), 'requestParameters.policyDocument'),
+      null()
+  )
+  | eval inline_policy = if(attach_kind="inline_policy_put", replace(inline_policy, "\\\\\"", "\""), inline_policy)
+
+  | eval policy_identifier = case(
+      attach_kind="policy_arn_attach", 'requestParameters.policyArn',
+      attach_kind="inline_policy_put", inline_policy,
+      attach_kind="group_membership", 'requestParameters.groupName',
+      true(), null()
+  )
+
+  | eval keep_managed = if(
+      attach_kind="policy_arn_attach"
+      AND match('requestParameters.policyArn', "(?i)/(admin[^/]*|[^/]*fullaccess[^/]*|[^/]*write[^/]*|[^/]*execution[^/]*|[^/]*poweruser[^/]*)$"),
+      1, 0
+  )
+  | eval keep_group = if(attach_kind="group_membership", 1, 0)
+
+  | eval keep_inline=0
+  | appendpipe [
+      | where attach_kind="inline_policy_put"
+
+      | eval raw_action_star   = if(match(inline_policy,"\"Action\"\\s*:\\s*\"\\*\""), 1, 0)
+      | eval raw_resource_star = if(match(inline_policy,"\"Resource\"\\s*:\\s*\"\\*\""), 1, 0)
+
+      | spath input=inline_policy path=Statement{} output=stmt
+      | eval spath_ok = if(isnotnull(stmt), 1, 0)
+      | eval stmt = if(spath_ok=1, stmt, "{\"Action\":\"__UNPARSEABLE__\"}")
+      | mvexpand stmt
+
+      | spath input=stmt path=Action{} output=actions_mv
+      | spath input=stmt path=Action  output=action_single
+      | eval actions = coalesce(actions_mv, action_single)
+
+      | spath input=stmt path=NotAction{} output=notactions_mv
+      | spath input=stmt path=NotAction  output=notaction_single
+      | eval notactions = coalesce(notactions_mv, notaction_single)
+
+      | spath input=stmt path=Resource{} output=resources_mv
+      | spath input=stmt path=Resource  output=resource_single
+      | eval resources = coalesce(resources_mv, resource_single)
+
+      | spath input=stmt path=Condition output=condition
+
+      | eval actions=mvjoin(actions,",")
+      | eval resources=mvjoin(resources,",")
+
+      | eval has_wild_action   = if(like(actions,"%*%") OR raw_action_star=1, 1, 0)
+      | eval has_star_resource = if(like(resources,"%*%") OR raw_resource_star=1, 1, 0)
+      | eval has_notaction     = if(isnotnull(notactions), 1, 0)
+      | eval has_condition     = if(isnotnull(condition), 1, 0)
+
+      | eval priv_escalation_perms = if(
+          match(
+              actions,
+              "(?i)^(iam|sts|organizations|kms):.*(Create|Put|Attach|Set|Update|Add|Delete|AssumeRole|PassRole)"
+          ),
+          1, 0
+      )
+
+      | eval keep_inline = if(
+          priv_escalation_perms=1
+          OR has_notaction=1
+          OR (has_wild_action=1 AND has_star_resource=1 AND has_condition=0),
+          1, 0
+      )
+      | where keep_inline=1
+
+      | eval keep_managed=0, keep_group=0
+  ]
+
+  | where keep_managed=1 OR keep_inline=1 OR keep_group=1
+
   | stats
-      min(_time)                  as initial_detection_time
-      values(sourceIPAddress)     as sourceip
-      values(eventName)           as actions
-      values(target_principal)    as principal_created
-      values(policy_identifier)   as policy_attached
-      values(userAgent)           as useragent
-      values(aws_account_id)      as cloudaccount
-      values(ui_type)             as identity_type
-      values(is_automation)       as is_automation
-    by user_arn
+      min(_time) as initial_detection_time
+      values(sourceIPAddress) as sourceip
+      values(eventName) as action
+      values(target_principal) as principal_created
+      values(policy_identifier) as policy_attached
+      values(userAgent) as useragent
+      values(userIdentity.accountId) as cloudaccount
+    by userIdentity.arn
 
   | eval initial_detection_time = strftime(initial_detection_time, "%F %T %Z")
