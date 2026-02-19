@@ -7,7 +7,8 @@ has a policy attached to it by the same actor within a 10 minute time frame.
 This sequence is a suspicious TTP often used by attackers to provision a new, privileged "shadow" account 
 or role for persistence and lateral movement, bypassing existing accounts or role assumption paths.
 
-some fields may need to be changed to represent your current environment
+Update: Detection has been tuned to identify managed & inline policies that may contain privilege escaltion permssions.
+
 tags:
   - attack.persistence
   - attack.privilege_escalation
@@ -97,4 +98,3 @@ index=cloudtrail sourcetype=aws:cloudtrail eventSource="iam.amazonaws.com"
     by user_arn
 
   | eval initial_detection_time = strftime(initial_detection_time, "%F %T %Z")
-
