@@ -1,0 +1,22 @@
+````
+Author: Tayvion P (@tayontech
+Description: 
+  Detects the creation or modification of repository webhooks. Attackers use webhooks for 
+  real-time data exfiltration of code pushes, pull request comments, and workflow data. 
+  Crucially, once a webhook is established, it operates independently of the creating user; 
+  revoking the creator's credentials will NOT stop the data flow. Only deleting the webhook 
+  itself terminates the exfiltration.
+````
+index=github action IN ("hook.create","hook.config_changed","hook.events_changed","hook.active_changed")
+| stats 
+    min(_time) as initial_detection_time
+    values(operation_type) as operation_type
+    values(action) as action
+    values(config.url) as url 
+    values(repo) as affected_repo
+    values(token_scopes) as token_scopes
+    values(user_agent) as useragent
+    values(business) as business
+    values(org) as org
+    by actor token_id
+| eval initial_detection_time = strftime(initial_detection_time, "%F %T %Z")

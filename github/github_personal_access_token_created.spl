@@ -1,0 +1,22 @@
+````
+Author: Tayvion P (@tayontech
+Description: 
+Detects the creation of a new Personal Access Token. Attackers frequently create PATs 
+  after gaining initial access to an account to maintain persistence that survives a password reset. 
+  Tokens with broad scopes (repo, admin:org) allow for full repository exfiltration and 
+  administrative manipulation of the organization.
+```
+index=github action="personal_access_token.create"
+| stats
+      min(_time) as initial_detection_time
+      values(actor_ip) as sourceip
+      values(action) as action
+      values(operation_type) as operation_type
+      values(user_programmatic_access_name) as token_name
+      values(hashed_token) as hashed_token
+      values(user_agent) as useragent
+      values(business) as business
+      values(org) as org
+      values(programmatic_access_type) as programmatic_access_type
+    by user token_id
+| eval initial_detection_time = strftime(initial_detection_time, "%F %T %Z")
