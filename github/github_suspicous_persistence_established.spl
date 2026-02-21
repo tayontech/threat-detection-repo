@@ -15,6 +15,7 @@ index="github" action IN (
   "repo.create_deploy_key",
   "hook.create","hook.config_changed","hook.events_changed","hook.active_changed"
 )
+| where actor_is_bot="false"
 | sort 0 actor _time
 
 | eval is_pat   = if(action="personal_access_token.create",1,0)
