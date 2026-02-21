@@ -38,18 +38,18 @@ index="github" action IN (
 
 | stats
     min(_time) as initial_detection_time
-    values(actor_ip) as actor_ip
+    values(actor_ip) as source_ip
     values(action) as action
     values(credential_event_type) as credential_event_type
     values(config.url) as webhook_url
     values(repo) as repo
     values(org) as org
-    values(user_agent) as user_agents
-    values(programmatic_access_type) as programmatic_access_types
+    values(user_agent) as user_agent
+    values(programmatic_access_type) as programmatic_access_type
     values(oauth_application_id) as oauth_app_ids
     values(user_programmatic_access_name) as programmatic_access_name
     values(hashed_token) as hashed_tokens
     values(token_scopes) as token_scopes
-  by actor token_id
+  by actor 
 
 | eval initial_detection_time = strftime(initial_detection_time, "%F %T %Z")
