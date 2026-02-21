@@ -1,0 +1,65 @@
+````
+Author: Tayvion P (@tayontech
+Description: 
+  Detects a suspicious sequence where a new credential (PAT, SSH key, or OAuth authorization) 
+  is created and then used to establish durable persistence via webhooks or deploy keys. 
+  This behavior typically occurs after an account compromise as an 
+  attacker attempts to "lock in" access that survives credential rotation and provides 
+  real-time exfiltration of repository data.
+
+````
+index="github" action IN (
+  "personal_access_token.create",
+  "public_key.create",
+  "oauth_authorization.create",
+  "repo.create_deploy_key",
+  "hook.create","hook.config_changed","hook.events_changed","hook.active_changed"
+)
+| where actor_is_bot="false"
+| sort 0 actor _time
+
+| eval is_pat   = if(action="personal_access_token.create",1,0)
+| eval is_ssh   = if(action="public_key.create",1,0)
+| eval is_oauth = if(action="oauth_authorization.create",1,0)
+
+| eval is_persist = if(match(action,"^hook\.") OR action="repo.create_deploy_key",1,0)
+
+| streamstats current=f last(eval(if(is_pat=1,_time,null())))   as pat_time   by actor
+| streamstats current=f last(eval(if(is_ssh=1,_time,null())))   as ssh_time   by actor
+| streamstats current=f last(eval(if(is_oauth=1,_time,null()))) as oauth_time by actor
+
+| eval pat_prog_name = if(is_pat=1 AND isnotnull(user_programmatic_access_name) AND user_programmatic_access_name!="", user_programmatic_access_name, null())
+| streamstats current=f last(pat_prog_name) as user_programmatic_access_name by actor
+
+| eval credential_time = case(
+    isnotnull(pat_time) AND pat_time>=coalesce(ssh_time,0) AND pat_time>=coalesce(oauth_time,0), pat_time,
+    isnotnull(ssh_time) AND ssh_time>=coalesce(pat_time,0) AND ssh_time>=coalesce(oauth_time,0), ssh_time,
+    isnotnull(oauth_time), oauth_time
+  )
+
+| eval credential_event_type = case(
+    credential_time=pat_time, "PAT created",
+    credential_time=ssh_time, "SSH key added",
+    credential_time=oauth_time, "OAuth authorization created"
+  )
+
+| eval time_to_persistence = _time - credential_time
+| where is_persist=1 AND isnotnull(credential_time) AND time_to_persistence>=0 AND time_to_persistence<=1800
+
+| stats
+    min(_time) as initial_detection_time
+    values(actor_ip) as source_ip
+    values(action) as action
+    values(credential_event_type) as credential_event_type
+    values(config.url) as webhook_url
+    values(repo) as repo
+    values(org) as org
+    values(user_agent) as user_agent
+    values(programmatic_access_type) as programmatic_access_type
+    values(oauth_application_id) as oauth_app_ids
+    values(user_programmatic_access_name) as programmatic_access_name
+    values(hashed_token) as hashed_tokens
+    values(token_scopes) as token_scopes
+  by actor 
+
+| eval initial_detection_time = strftime(initial_detection_time, "%F %T %Z")

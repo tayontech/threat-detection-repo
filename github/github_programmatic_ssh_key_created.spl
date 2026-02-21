@@ -1,0 +1,23 @@
+````
+Author: Tayvion P (@tayontech
+Description: 
+  Detects the addition of an SSH public key to a GitHub account using programmatic access 
+  (Personal Access Tokens, OAuth, or GitHub Apps). Unlike keys added via the Web UI, 
+  programmatic creation often bypasses manual verification steps and provides long-lived 
+  access that survives password resets and MFA changes. This is a common technique for 
+  attackers to establish persistent command line access to repositories.
+````
+index="github" action="public_key.create"
+| where isnotnull(programmatic_access_type) AND programmatic_access_type!=""
+| stats
+    min(_time) as initial_detection_time
+    values(action) as action
+    values(operation_type) as operation_type
+    values(title) as token_name
+    values(hashed_token) as hashed_token
+    values(programmatic_access_type) as programmatic_access_type
+    values(token_scopes) as token_scopes
+    values(business) as business
+    values(user_agent) as useragent
+  by actor, token_id
+| eval initial_detection_time = strftime(initial_detection_time, "%F %T %Z")
