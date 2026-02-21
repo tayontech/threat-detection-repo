@@ -1,0 +1,73 @@
+```
+Author: Tayvion P (@tayontech
+Description: 
+Detects programmatic GitHub data exfiltration by identifying non-interactive repository exports, clones, artifact downloads, or gist staging performed using tokens, OAuth applications, or GitHub Apps. 
+The detection focuses on bursty or multi-repository activity within a short time window, which can indicate automated source code collection, misuse of programmatic credentials, or post-compromise data extraction.
+```
+index="github" action IN ("repo.download_zip","git.clone","artifact.download","gist.create")
+| where actor_is_bot="false"
+| where isnotnull(programmatic_access_type) AND programmatic_access_type!=""
+   OR isnotnull(token_id)
+   OR isnotnull(hashed_token)
+   OR isnotnull(oauth_application_id)
+
+| sort 0 actor _time
+
+| eval exfil_type=case(
+    action="repo.download_zip","Repository ZIP export",
+    action="git.clone","Git clone",
+    action="artifact.download","CI artifact download",
+    action="gist.create","Gist staging"
+  )
+
+| streamstats current=f last(_time) as prev_time by actor
+| eval gap=_time-prev_time
+| eval new_session=if(isnull(prev_time) OR gap>1800,1,0)
+| streamstats sum(new_session) as session_id by actor
+
+| stats
+    min(_time) as initial_detection_time
+    count as exfil_events
+    dc(repo) as repo_count
+    values(repo) as repos
+    values(exfil_type) as exfil_types
+    values(action) as actions
+    values(user_agent) as user_agents
+    values(programmatic_access_type) as programmatic_access_types
+    values(oauth_application_id) as oauth_app_ids
+    values(token_id) as token_ids
+    values(hashed_token) as hashed_tokens
+    values(org) as orgs
+  by actor session_id
+
+| where
+    exfil_events >= 2
+    OR repo_count >= 2
+    OR mvfind(exfil_types,"CI artifact download") >= 0
+    OR mvfind(exfil_types,"Gist staging") >= 0
+
+| eval risk_note=case(
+    mvfind(exfil_types,"CI artifact download")>=0,"Programmatic artifact exfiltration",
+    mvfind(exfil_types,"Gist staging")>=0,"Programmatic data staging via Gist",
+    repo_count>=2,"Programmatic multi-repo data export",
+    exfil_events>=5,"High-volume programmatic data export",
+    true(),"Programmatic GitHub data exfiltration"
+  )
+
+| eval initial_detection_time=strftime(initial_detection_time,"%F %T %Z")
+
+| stats
+    min(initial_detection_time) as initial_detection_time
+    values(actions) as action
+    values(risk_note) as risk
+    values(exfil_types) as exfil_type
+    values(repos) as repo
+    values(orgs) as org
+    values(user_agents) as user_agent
+    values(programmatic_access_types) as programmatic_access_type
+    values(oauth_app_ids) as oauth_app_ids
+    values(token_ids) as token_ids
+    values(hashed_tokens) as hashed_tokens
+    max(exfil_events) as exfil_events
+    max(repo_count) as repo_count
+  by actor
