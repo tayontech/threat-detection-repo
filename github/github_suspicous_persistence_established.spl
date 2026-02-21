@@ -17,7 +17,6 @@ index="github" action IN (
 | streamstats current=f last(eval(if(is_ssh=1,_time,null())))   as ssh_time   by actor
 | streamstats current=f last(eval(if(is_oauth=1,_time,null()))) as oauth_time by actor
 
-/* carry forward PAT programmatic access name */
 | eval pat_prog_name = if(is_pat=1 AND isnotnull(user_programmatic_access_name) AND user_programmatic_access_name!="", user_programmatic_access_name, null())
 | streamstats current=f last(pat_prog_name) as user_programmatic_access_name by actor
 
