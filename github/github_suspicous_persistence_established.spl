@@ -1,3 +1,13 @@
+````
+Author: Tayvion P (@tayontech
+Description: 
+  Detects a suspicious sequence where a new credential (PAT, SSH key, or OAuth authorization) 
+  is created and then used to establish durable persistence via webhooks or deploy keys. 
+  This behavior typically occurs after an account compromise as an 
+  attacker attempts to "lock in" access that survives credential rotation and provides 
+  real-time exfiltration of repository data.
+
+````
 index="github" action IN (
   "personal_access_token.create",
   "public_key.create",
